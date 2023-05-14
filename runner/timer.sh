@@ -1,6 +1,6 @@
 # !/bin/sh
 
-runCmd="python3 main.py"
+runCmd="python3 prima.py"
 
 # time (
 timeout 1s sh <<EOF

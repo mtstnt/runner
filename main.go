@@ -16,20 +16,10 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/stdcopy"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
-
-func dbg(v any, die ...bool) {
-	w, err := json.MarshalIndent(v, "", "\t")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(string(w))
-	if len(die) >= 1 && die[0] {
-		os.Exit(1)
-	}
-}
 
 func main() {
 	if err := run(); err != nil {
@@ -37,8 +27,8 @@ func main() {
 	}
 }
 
-func writeFileToTarWriter(tw *tar.Writer, filename string) error {
-	fp, err := os.Open(filename)
+func writeFileToTarWriter(tw *tar.Writer, filename string, srcFilename string) error {
+	fp, err := os.Open(srcFilename)
 	if err != nil {
 		return err
 	}
@@ -65,30 +55,50 @@ func writeFileToTarWriter(tw *tar.Writer, filename string) error {
 	return nil
 }
 
-func createTarfileOfCode() (io.Reader, error) {
-	var sourceFiles = map[string]string{
-		"main.py": `
-import hello
-n = int(input())
-co = 0
-for i in range(1, n + 1):
-	if n % i == 0:
-		co += 1
-if co == 2:
-	print(f"{n} PRIMA")
-else:
-	print(f"{n} TIDAK PRIMA")
-`,
-		"hello/__init__.py": `
-def sayer(name):
-	print("hello world,", name)
-`,
+func loadFilesRecursive(pathname string, mapRef map[string]string) error {
+	dirEntries, err := os.ReadDir(pathname)
+	if err != nil {
+		return err
 	}
+
+	for _, entry := range dirEntries {
+		if entry.IsDir() {
+			if err := loadFilesRecursive(pathname+"/"+entry.Name(), mapRef); err != nil {
+				return err
+			}
+		} else {
+			f, err := os.ReadFile(pathname + "/" + entry.Name())
+			if err != nil {
+				return err
+			}
+			mapRef[entry.Name()] = string(f)
+		}
+	}
+
+	return nil
+}
+
+func loadSourceFiles(pathname string) (map[string]string, error) {
+	var sourceFiles = make(map[string]string)
+	loadFilesRecursive(pathname, sourceFiles)
+	return sourceFiles, nil
+}
+
+func createTarfileOfCode() (io.Reader, error) {
+	sourceFiles, err := loadSourceFiles("examples/python")
+	if err != nil {
+		return nil, err
+	}
+	m, err := json.MarshalIndent(sourceFiles, "", "\t")
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(string(m))
 
 	var buffer bytes.Buffer
 
 	tw := tar.NewWriter(&buffer)
-	writeFileToTarWriter(tw, "timer.sh")
+	writeFileToTarWriter(tw, "timer.sh", "runner/timer.sh")
 
 	for filePath, fileContents := range sourceFiles {
 		header := tar.Header{
@@ -158,17 +168,16 @@ func run() error {
 	}
 
 	if len(result) == 0 {
-		// TODO: Build still error!
-		fp, err := os.Open("Dockerfile.runner")
+		tarfile, err := archive.TarWithOptions("runner/", &archive.TarOptions{})
 		if err != nil {
 			return err
 		}
-		defer fp.Close()
 
 		if _, err = dc.ImageBuild(ctx,
-			fp,
+			tarfile,
 			types.ImageBuildOptions{
-				Tags: []string{"runner:latest"},
+				Tags:   []string{"runner:latest"},
+				Remove: true,
 			},
 		); err != nil {
 			fmt.Println("error build")
@@ -200,7 +209,9 @@ func run() error {
 			Image:           imageID,
 			NetworkDisabled: true,
 			WorkingDir:      "/code",
-			Cmd:             []string{"sh", "./timer.sh"},
+			Cmd: []string{
+				"sh", "./timer.sh",
+			},
 		},
 		&container.HostConfig{
 			Resources: container.Resources{
@@ -286,8 +297,8 @@ func run() error {
 
 	// TODO: Always slice from index 9 upwards to remove SIZE infos.
 	// Refer to client.ContainerLogs docs.
-	fmt.Println("STDERR:\n" + bufStderr.String())
 	fmt.Println("STDOUT:\n" + bufStdout.String())
+	fmt.Println("STDERR:\n" + bufStderr.String())
 
 	disposeContainer(ctx, dc, containerID)
 	return nil
